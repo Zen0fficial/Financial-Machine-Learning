@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "us-factor-screening"
+version = "0.1.0"
+description = "Point-in-time-aware US market factor research and portfolio backtesting"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "bt>=1.2.0,<2",
+    "numpy>=1.26,<3",
+    "pandas>=2.2,<4",
+    "scipy>=1.12,<2",
+    "statsmodels>=0.14,<1",
+    "yfinance>=1.0,<2",
+]
+
+[project.optional-dependencies]
+data = [
+    "pyarrow>=16,<24",
+]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.15,<1",
+]
+
+[project.scripts]
+us-factor = "us_factor_screening.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: tests that access live market-data services",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]

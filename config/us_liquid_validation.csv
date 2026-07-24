@@ -1,0 +1,18 @@
+symbol,name,sector
+AAPL,Apple,Information Technology
+MSFT,Microsoft,Information Technology
+NVDA,NVIDIA,Information Technology
+AMZN,Amazon,Consumer Discretionary
+GOOGL,Alphabet,Communication Services
+META,Meta Platforms,Communication Services
+JPM,JPMorgan Chase,Financials
+BAC,Bank of America,Financials
+XOM,Exxon Mobil,Energy
+CVX,Chevron,Energy
+JNJ,Johnson & Johnson,Health Care
+UNH,UnitedHealth Group,Health Care
+PG,Procter & Gamble,Consumer Staples
+KO,Coca-Cola,Consumer Staples
+HD,Home Depot,Consumer Discretionary
+CAT,Caterpillar,Industrials
+SPY,SPDR S&P 500 ETF,Benchmark
