@@ -62,39 +62,246 @@ import pandas as pd  # noqa: E402
 from us_factor_screening.data import MarketDataError  # noqa: E402
 from us_factor_screening.providers import PolygonMarketDataSource  # noqa: E402
 
-# Fallback universe used only if no bundled CSV is found. The bundled
-# data/free_nasdaq100_2024_2026/nasdaq100_universe.csv is preferred and
-# normally supplies the full 97-symbol eligible universe.
-DEFAULT_SYMBOLS = sorted({
-    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMGN", "AMZN", "ANSS",
-})
+# Production runs must pass --universe-file for the intended Nasdaq-100 or
+# S&P 500 member history. There is deliberately no smoke-test fallback.
+
+SYMBOL_COLUMNS = ("Symbol", "symbol", "Ticker", "ticker")
+LISTED_DATE_COLUMNS = (
+    "listed_date", "list_date", "listing_date", "ipo_date", "start_date",
+    "index_start", "membership_start",
+)
+DELISTED_DATE_COLUMNS = (
+    "delisted_date", "delist_date", "delisting_date", "end_date",
+    "index_end", "membership_end",
+)
+ACTIVE_COLUMNS = ("active", "is_active")
+STATUS_COLUMNS = ("status", "listing_status")
+SOURCE_EXCLUSION_COLUMNS = ("exclusion_reason", "source_exclusion_reason")
+
+
+def _symbol_values(value: str | None) -> set[str]:
+    """Resolve comma-separated symbols or a one-column CSV into a symbol set."""
+    if not value:
+        return set()
+    if Path(value).exists():
+        frame = pd.read_csv(value)
+        for col in ("Symbol", "symbol", "Ticker", "ticker"):
+            if col in frame.columns:
+                return {str(s).strip().upper() for s in frame[col] if str(s).strip()}
+        return {str(s).strip().upper() for s in frame.iloc[:, 0] if str(s).strip()}
+    return {s.strip().upper() for s in value.split(",") if s.strip()}
+
+
+def _find_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
+    exact = {str(col): str(col) for col in frame.columns}
+    lowered = {str(col).lower(): str(col) for col in frame.columns}
+    for candidate in candidates:
+        if candidate in exact:
+            return exact[candidate]
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+    return None
+
+
+def _parse_optional_dates(values: pd.Series | None, index: pd.Index) -> pd.Series:
+    if values is None:
+        return pd.Series(pd.NaT, index=index)
+    return pd.to_datetime(values, errors="coerce").dt.normalize()
+
+
+def _format_optional_dates(values: pd.Series) -> pd.Series:
+    return values.dt.strftime("%Y-%m-%d").fillna("")
+
+
+def _default_universe_candidates(universe: str) -> list[Path]:
+    candidates = [
+        _PROJECT_ROOT / "data" / "universes" / f"{universe}.csv",
+        _PROJECT_ROOT / "data" / f"{universe}_universe.csv",
+    ]
+    if universe == "nasdaq100":
+        candidates.extend([
+            _PROJECT_ROOT / "data" / "free_nasdaq100_2024_2026" / "nasdaq100_universe.csv",
+            _PROJECT_ROOT / "data" / "nasdaq100_universe.csv",
+        ])
+    return candidates
+
+
+def _load_universe_source(args: argparse.Namespace) -> tuple[pd.DataFrame, str]:
+    universe_file = getattr(args, "universe_file", None)
+    if universe_file:
+        path = Path(universe_file)
+        return pd.read_csv(path), str(path)
+
+    symbols_arg = getattr(args, "symbols", "all")
+    if symbols_arg and str(symbols_arg).lower() != "all":
+        path = Path(str(symbols_arg))
+        if path.exists():
+            return pd.read_csv(path), str(path)
+        return pd.DataFrame({"symbol": sorted(_symbol_values(str(symbols_arg)))}), "cli-symbols"
+
+    universe = str(getattr(args, "universe", "custom"))
+    for candidate in _default_universe_candidates(universe):
+        if candidate.exists():
+            return pd.read_csv(candidate), str(candidate)
+
+    raise FileNotFoundError(
+        f"No universe file found for '{universe}'. Pass --universe-file with a CSV "
+        "containing at least a symbol/ticker column and optional lifecycle fields."
+    )
+
+
+def build_universe_table(args: argparse.Namespace) -> pd.DataFrame:
+    """Build a normalized universe table with listing lifecycle fields."""
+    frame, source = _load_universe_source(args)
+    symbol_col = _find_column(frame, SYMBOL_COLUMNS)
+    if symbol_col is None:
+        raise ValueError("Universe source must contain a symbol/ticker column")
+
+    table = pd.DataFrame({"symbol": frame[symbol_col].astype(str).str.strip().str.upper()})
+    table = table[table["symbol"] != ""].drop_duplicates("symbol").reset_index(drop=True)
+    frame = frame.loc[table.index].reset_index(drop=True)
+
+    listed_col = _find_column(frame, LISTED_DATE_COLUMNS)
+    delisted_col = _find_column(frame, DELISTED_DATE_COLUMNS)
+    active_col = _find_column(frame, ACTIVE_COLUMNS)
+    status_col = _find_column(frame, STATUS_COLUMNS)
+    source_exclusion_col = _find_column(frame, SOURCE_EXCLUSION_COLUMNS)
+
+    listed_dates = _parse_optional_dates(frame[listed_col] if listed_col else None, table.index)
+    delisted_dates = _parse_optional_dates(frame[delisted_col] if delisted_col else None, table.index)
+    period_start = pd.Timestamp(getattr(args, "listed_since", "2024-01-01")).normalize()
+    period_end = pd.Timestamp(getattr(args, "end", datetime.now(UTC).strftime("%Y-%m-%d"))).normalize()
+    explicit_excluded = _symbol_values(getattr(args, "exclude_symbols", None))
+
+    listed_during_period = (listed_dates.isna() | (listed_dates <= period_end)) & (
+        delisted_dates.isna() | (delisted_dates >= period_start)
+    )
+    explicitly_excluded = table["symbol"].isin(explicit_excluded)
+
+    source_exclusion = (
+        frame[source_exclusion_col].fillna("").astype(str).str.strip()
+        if source_exclusion_col
+        else pd.Series("", index=table.index)
+    )
+    respect_source_exclusions = bool(getattr(args, "respect_source_exclusions", False))
+    source_excluded = source_exclusion.ne("") & respect_source_exclusions
+
+    reasons: list[str] = []
+    for idx in range(len(table)):
+        symbol_reasons: list[str] = []
+        if not bool(listed_during_period.iloc[idx]):
+            symbol_reasons.append("not_listed_during_period")
+        if bool(explicitly_excluded.iloc[idx]):
+            symbol_reasons.append("explicitly_excluded")
+        if bool(source_excluded.iloc[idx]):
+            symbol_reasons.append(str(source_exclusion.iloc[idx]))
+        reasons.append(";".join(symbol_reasons))
+
+    if active_col:
+        active = frame[active_col].map(lambda value: str(value).strip().lower() in {"1", "true", "yes", "y"})
+    else:
+        active = pd.Series(pd.NA, index=table.index)
+    status = frame[status_col].fillna("").astype(str) if status_col else pd.Series("", index=table.index)
+
+    table["universe"] = getattr(args, "universe", "custom")
+    table["universe_source"] = source
+    table["listed_since"] = period_start.strftime("%Y-%m-%d")
+    table["listed_until"] = period_end.strftime("%Y-%m-%d")
+    table["listed_date"] = _format_optional_dates(listed_dates)
+    table["delisted_date"] = _format_optional_dates(delisted_dates)
+    table["active"] = active
+    table["source_status"] = status
+    table["source_exclusion_reason"] = source_exclusion
+    table["listed_during_period"] = listed_during_period
+    table["listed_after_period_start"] = listed_dates.notna() & (listed_dates > period_start) & (listed_dates <= period_end)
+    table["delisted_during_period"] = (
+        delisted_dates.notna() & (delisted_dates >= period_start) & (delisted_dates <= period_end)
+    )
+    table["included"] = listed_during_period & ~explicitly_excluded & ~source_excluded
+    table["exclusion_reason"] = reasons
+    return table.sort_values("symbol").reset_index(drop=True)
+
+
+def build_symbol_windows(
+    universe: pd.DataFrame, start: str, end: str
+) -> dict[str, tuple[str, str]]:
+    """Clamp the requested range to each included symbol's listing lifecycle."""
+    requested_start = pd.Timestamp(start).normalize()
+    requested_end = pd.Timestamp(end).normalize()
+    windows: dict[str, tuple[str, str]] = {}
+    for row in universe.loc[universe["included"]].itertuples(index=False):
+        symbol_start = requested_start
+        symbol_end = requested_end
+        listed_date = pd.to_datetime(row.listed_date, errors="coerce")
+        delisted_date = pd.to_datetime(row.delisted_date, errors="coerce")
+        if not pd.isna(listed_date):
+            symbol_start = max(symbol_start, listed_date.normalize())
+        if not pd.isna(delisted_date):
+            symbol_end = min(symbol_end, delisted_date.normalize())
+        if symbol_start <= symbol_end:
+            windows[str(row.symbol)] = (
+                symbol_start.strftime("%Y-%m-%d"),
+                symbol_end.strftime("%Y-%m-%d"),
+            )
+    return windows
+
+
+def build_daily_coverage_windows(
+    symbols: list[str],
+    symbol_windows: dict[str, tuple[str, str]],
+    daily_cache_dir: Path,
+    logger: logging.Logger | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Move each symbol window start to its first actual daily row.
+
+    Lifecycle metadata can be broader than the provider's effective coverage
+    for a ticker. Later date-sensitive phases should avoid pre-coverage starts
+    that Polygon may report as malformed/no-results responses, while preserving
+    the requested/lifecycle end date so resumed downloads keep extending forward.
+    """
+    adjusted = dict(symbol_windows)
+    for symbol in symbols:
+        if symbol not in symbol_windows:
+            continue
+        matches = sorted(daily_cache_dir.glob(f"polygon_1d_*_{symbol}_*.csv"))
+        if not matches:
+            continue
+
+        dates: list[pd.Timestamp] = []
+        for path in matches:
+            try:
+                frame = pd.read_csv(path, usecols=["Date"])
+            except Exception:  # noqa: BLE001
+                continue
+            parsed = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+            if not parsed.empty:
+                dates.extend(parsed.dt.normalize().tolist())
+        if not dates:
+            continue
+
+        planned_start, planned_end = symbol_windows[symbol]
+        start_ts = max(pd.Timestamp(planned_start), min(dates))
+        end_ts = pd.Timestamp(planned_end)
+        if start_ts > end_ts:
+            continue
+
+        new_window = (start_ts.strftime("%Y-%m-%d"), end_ts.strftime("%Y-%m-%d"))
+        if new_window != symbol_windows[symbol]:
+            adjusted[symbol] = new_window
+            if logger:
+                logger.info(
+                    "  %s: adjusted start date %s → %s based on first daily row",
+                    symbol,
+                    planned_start,
+                    new_window[0],
+                )
+    return adjusted
 
 
 def load_symbols(args: argparse.Namespace) -> list[str]:
-    """Resolve the symbol universe from CLI args or a bundled file."""
-    if args.symbols and args.symbols.lower() != "all":
-        if Path(args.symbols).exists():
-            frame = pd.read_csv(args.symbols)
-            # Look for a Symbol/Symbol column; fall back to first column.
-            for col in ("Symbol", "symbol", "Ticker", "ticker"):
-                if col in frame.columns:
-                    return sorted({str(s).strip().upper() for s in frame[col] if str(s).strip()})
-            return sorted({str(s).strip().upper() for s in frame.iloc[:, 0] if str(s).strip()})
-        return sorted({s.strip().upper() for s in args.symbols.split(",") if s.strip()})
-    # Try the existing bundle's universe file.
-    for candidate in (
-        _PROJECT_ROOT / "data" / "free_nasdaq100_2024_2026" / "nasdaq100_universe.csv",
-        _PROJECT_ROOT / "data" / "nasdaq100_universe.csv",
-    ):
-        if candidate.exists():
-            frame = pd.read_csv(candidate)
-            for col in ("Symbol", "symbol", "Ticker", "ticker"):
-                if col in frame.columns:
-                    eligible = frame
-                    if "exclusion_reason" in frame.columns:
-                        eligible = frame[frame["exclusion_reason"].isna()]
-                    return sorted({str(s).strip().upper() for s in eligible[col] if str(s).strip()})
-    return DEFAULT_SYMBOLS
+    """Resolve included symbols from the normalized universe table."""
+    universe = build_universe_table(args)
+    return universe.loc[universe["included"], "symbol"].astype(str).tolist()
 
 
 def setup_logging(log_file: Path | None) -> logging.Logger:
@@ -131,7 +338,7 @@ def fetch_symbol_daily(
 
 
 def fetch_symbol_minute(
-    source: PolygonMarketDataSource, symbol: str, start: str, end: str, logger: logging.Logger
+    source: PolygonMarketDataSource, start: str, end: str, symbol: str, logger: logging.Logger
 ) -> tuple[bool, str]:
     """Download 1-minute aggregates for one symbol. Returns (ok, message)."""
     try:
@@ -275,7 +482,7 @@ def fetch_option_snapshots_for_symbol(
         return False, f"{symbol}: unexpected error: {exc}"
 
 
-# Lock guarding concurrent appends to the shared ticker_details.csv.
+# Lock guarding concurrent updates to the shared ticker_details.csv.
 _TICKER_DETAILS_LOCK = threading.Lock()
 
 
@@ -415,36 +622,75 @@ def fetch_dividends(
 
 
 def fetch_ticker_details(
-    source: PolygonMarketDataSource, symbol: str, logger: logging.Logger
+    source: PolygonMarketDataSource,
+    symbol: str,
+    logger: logging.Logger,
+    reference_date: str | None = None,
 ) -> tuple[bool, str]:
-    """Download company info for one symbol and append to a combined CSV."""
+    """Download company info and merge it into a schema-aligned combined CSV."""
     try:
         out_path = source.cache_dir / "ticker_details.csv"
-        # Best-effort cache check (race conditions are benign — worst case is a duplicate row).
-        if out_path.exists():
-            try:
+        with _TICKER_DETAILS_LOCK:
+            if out_path.exists():
                 existing = pd.read_csv(out_path)
                 if "ticker" in existing.columns and symbol in existing["ticker"].astype(str).values:
                     match = existing.loc[existing["ticker"].astype(str) == symbol]
                     if not match.empty and "name" in match.columns:
                         name = str(match["name"].iloc[0])
                         return True, f"{symbol}: {name} (cached)"
-            except Exception:  # noqa: BLE001
-                pass
-        url = f"{source.base_url}/v3/reference/tickers/{symbol}?apiKey={source.api_key}"
-        payload = _fetch_single(source, url)
-        results = payload.get("results")
-        if not isinstance(results, dict):
-            return False, f"{symbol}: no results"
+
+        urls = [(None, f"{source.base_url}/v3/reference/tickers/{symbol}")]
+        if reference_date:
+            historical_date = (
+                pd.Timestamp(reference_date) - pd.offsets.BusinessDay(1)
+            ).strftime("%Y-%m-%d")
+            urls.append((historical_date, f"{source.base_url}/v3/reference/tickers/{symbol}?date={historical_date}"))
+
+        results: dict[str, Any] | None = None
+        used_reference_date: str | None = None
+        errors: list[str] = []
+        for candidate_date, url in urls:
+            try:
+                payload = _fetch_single(source, url)
+                candidate = payload.get("results")
+                if isinstance(candidate, dict):
+                    results = candidate
+                    used_reference_date = candidate_date
+                    break
+                errors.append(f"{candidate_date or 'current'}: no results")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{candidate_date or 'current'}: {exc}")
+        if results is None:
+            return False, f"{symbol}: {'; '.join(errors)}"
+
         name = results.get("name") or symbol
         row = pd.json_normalize([results])
+        row["reference_date"] = used_reference_date or ""
         with _TICKER_DETAILS_LOCK:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            write_header = not out_path.exists()
-            row.to_csv(out_path, mode="a", header=write_header, index=False)
-        return True, f"{symbol}: {name}"
+            existing = pd.read_csv(out_path) if out_path.exists() else pd.DataFrame()
+            combined = pd.concat([existing, row], ignore_index=True, sort=False)
+            combined = combined.drop_duplicates(subset=["ticker"], keep="last")
+            combined = combined.sort_values("ticker").reset_index(drop=True)
+            tmp_path = out_path.with_suffix(".csv.tmp")
+            combined.to_csv(tmp_path, index=False)
+            tmp_path.replace(out_path)
+        suffix = f" (as of {used_reference_date})" if used_reference_date else ""
+        return True, f"{symbol}: {name}{suffix}"
     except Exception as exc:  # noqa: BLE001
         return False, f"{symbol}: {exc}"
+
+
+def fetch_ticker_details_for_window(
+    source: PolygonMarketDataSource,
+    start: str,
+    end: str,
+    symbol: str,
+    logger: logging.Logger,
+) -> tuple[bool, str]:
+    """Fetch current details, falling back to the symbol lifecycle window."""
+    del start
+    return fetch_ticker_details(source, symbol, logger, reference_date=end)
 
 
 def fetch_open_close(
@@ -514,17 +760,21 @@ def run_phase(
     workers: int,
     logger: logging.Logger,
     *args,
+    symbol_args: dict[str, tuple[Any, ...]] | None = None,
 ) -> dict[str, Any]:
     """Run a download phase concurrently.
 
-    `fn` is called as `fn(*args, symbol, logger)` and returns a tuple whose
-    first element is a success bool and whose second is a message string.
+    The function is called with shared args, then symbol and logger. When
+    symbol_args is supplied, its per-symbol tuples replace the shared args.
     """
     logger.info(f"=== Phase: {name} ({len(symbols)} symbols, {workers} workers) ===")
     start = time.time()
     results: list[tuple[str, bool, str]] = []
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_symbol = {pool.submit(fn, *args, sym, logger): sym for sym in symbols}
+        future_to_symbol = {
+            pool.submit(fn, *(symbol_args[sym] if symbol_args else args), sym, logger): sym
+            for sym in symbols
+        }
         for future in cf.as_completed(future_to_symbol):
             sym = future_to_symbol[future]
             try:
@@ -553,19 +803,31 @@ def run_phase(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download a Polygon market-data database for the Nasdaq-100.",
+        description="Download a Polygon market-data database for a named US equity universe.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--api-key", default=os.getenv("POLYGON_API_KEY"),
                         help="Polygon API key (or set POLYGON_API_KEY env var)")
-    parser.add_argument("--data-dir", default="data/polygon_db",
-                        help="Root directory for the downloaded database")
+    parser.add_argument("--universe", default="nasdaq100",
+                        choices=["nasdaq100", "sp500", "custom"],
+                        help="Named universe; also controls the default data-dir")
+    parser.add_argument("--universe-file", default=None,
+                        help=("CSV universe file. Expected symbol column plus optional listed_date, "
+                              "delisted_date, active/status, and exclusion_reason columns."))
+    parser.add_argument("--data-dir", default=None,
+                        help="Root directory for the downloaded database (default: data/polygon_<universe>)")
     parser.add_argument("--start", default="2024-01-02", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", default=datetime.now(UTC).strftime("%Y-%m-%d"),
                         help="End date (YYYY-MM-DD); defaults to today")
+    parser.add_argument("--listed-since", default="2024-01-01",
+                        help="Include symbols listed at any point on/after this date")
     parser.add_argument("--symbols", default="all",
-                        help="Comma-separated tickers, path to CSV, or 'all'")
+                        help="Comma-separated tickers, path to CSV, or 'all' (overridden by --universe-file)")
+    parser.add_argument("--exclude-symbols", default="",
+                        help="Comma-separated tickers or CSV to exclude from the universe")
+    parser.add_argument("--respect-source-exclusions", action="store_true",
+                        help="Exclude rows that already have source exclusion_reason values")
     parser.add_argument("--workers", type=int, default=4,
                         help="Concurrent download workers (default: 4)")
     parser.add_argument("--base-url", default="https://api.massiveprivateserver.site")
@@ -593,14 +855,25 @@ def main() -> int:
         print("ERROR: --api-key or POLYGON_API_KEY env var is required", file=sys.stderr)
         return 2
 
-    data_dir = Path(args.data_dir).resolve()
+    default_data_dir = Path("data") / f"polygon_{args.universe}"
+    data_dir = Path(args.data_dir or default_data_dir).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     log_file = Path(args.log_file) if args.log_file else data_dir / "download.log"
     logger = setup_logging(log_file)
     logger.info(f"Polygon database build started → {data_dir}")
 
-    symbols = load_symbols(args)
-    logger.info(f"Universe: {len(symbols)} symbols ({', '.join(symbols[:5])}... )")
+    universe_table = build_universe_table(args)
+    universe_path = data_dir / "universe.csv"
+    universe_table.to_csv(universe_path, index=False)
+    symbols = universe_table.loc[universe_table["included"], "symbol"].astype(str).tolist()
+    symbol_windows = build_symbol_windows(universe_table, args.start, args.end)
+    symbols = [symbol for symbol in symbols if symbol in symbol_windows]
+    excluded_count = len(universe_table) - len(symbols)
+    logger.info(
+        f"Universe {args.universe}: {len(symbols)} included, {excluded_count} excluded "
+        f"({', '.join(symbols[:5])}... )"
+    )
+    logger.info(f"Universe metadata written → {universe_path}")
     if not symbols:
         logger.error("No symbols to download")
         return 2
@@ -638,12 +911,30 @@ def main() -> int:
 
     if not args.skip_daily:
         phases.append(run_phase(
-            "daily", fetch_symbol_daily, symbols, args.workers, logger, daily_source, args.start, args.end
+            "daily",
+            fetch_symbol_daily,
+            symbols,
+            args.workers,
+            logger,
+            symbol_args={
+                symbol: (daily_source, *symbol_windows[symbol]) for symbol in symbols
+            },
         ))
+
+    daily_coverage_windows = build_daily_coverage_windows(
+        symbols, symbol_windows, daily_source.cache_dir, logger
+    )
 
     if args.minute and not args.skip_minute:
         phases.append(run_phase(
-            "minute", fetch_symbol_minute, symbols, max(1, args.workers // 2), logger, minute_source, args.start, args.end
+            "minute",
+            fetch_symbol_minute,
+            symbols,
+            max(1, args.workers // 2),
+            logger,
+            symbol_args={
+                symbol: (minute_source, *daily_coverage_windows[symbol]) for symbol in symbols
+            },
         ))
 
     if not args.skip_options_contracts:
@@ -653,7 +944,14 @@ def main() -> int:
 
     if not args.skip_options_aggregates:
         phases.append(run_phase(
-            "options-aggregates", fetch_option_aggregates_for_symbol, symbols, args.workers, logger, options_source, args.start, args.end
+            "options-aggregates",
+            fetch_option_aggregates_for_symbol,
+            symbols,
+            args.workers,
+            logger,
+            symbol_args={
+                symbol: (options_source, *daily_coverage_windows[symbol]) for symbol in symbols
+            },
         ))
 
     if not args.skip_options_snapshots:
@@ -683,28 +981,58 @@ def main() -> int:
 
     if not args.skip_ticker_details:
         phases.append(run_phase(
-            "ticker-details", fetch_ticker_details, symbols, args.workers, logger, options_source
+            "ticker-details",
+            fetch_ticker_details_for_window,
+            symbols,
+            args.workers,
+            logger,
+            symbol_args={
+                symbol: (options_source, *daily_coverage_windows[symbol]) for symbol in symbols
+            },
         ))
 
     if args.open_close and not args.skip_open_close:
-        n_days = len(pd.bdate_range(start=args.start, end=args.end))
-        total_requests = n_days * len(symbols)
+        total_requests = sum(
+            len(pd.bdate_range(start=window_start, end=window_end))
+            for window_start, window_end in daily_coverage_windows.values()
+        )
         logger.warning(
-            f"open-close phase: ~{total_requests} requests "
-            f"({n_days} trading days × {len(symbols)} symbols) — 1 request per symbol per day"
+            f"open-close phase: ~{total_requests} lifecycle-adjusted requests "
+            f"across {len(symbols)} symbols — 1 request per symbol per business day"
         )
         phases.append(run_phase(
-            "open-close", fetch_open_close, symbols, max(1, args.workers // 2),
-            logger, options_source, args.start, args.end
+            "open-close",
+            fetch_open_close,
+            symbols,
+            max(1, args.workers // 2),
+            logger,
+            symbol_args={
+                symbol: (options_source, *daily_coverage_windows[symbol]) for symbol in symbols
+            },
         ))
 
     # Final manifest.
     manifest = {
         "schema_version": 1,
         "built_at": datetime.now(UTC).isoformat(),
+        "universe": args.universe,
+        "universe_file": args.universe_file,
+        "universe_metadata": str(universe_path),
+        "listed_since": args.listed_since,
         "start": args.start,
         "end": args.end,
         "symbols": symbols,
+        "symbol_windows": {
+            symbol: {"start": window[0], "end": window[1]}
+            for symbol, window in symbol_windows.items()
+        },
+        "daily_coverage_windows": {
+            symbol: {"start": window[0], "end": window[1]}
+            for symbol, window in daily_coverage_windows.items()
+        },
+        "excluded_symbols": universe_table.loc[
+            ~universe_table["included"], ["symbol", "exclusion_reason"]
+        ].to_dict(orient="records"),
         "phases": [
             {"phase": p["phase"], "ok": p["ok"], "failed": p["failed"], "elapsed_s": p["elapsed_s"]}
             for p in phases

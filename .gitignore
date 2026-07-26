@@ -8,4 +8,6 @@ __pycache__/
 *.log
 .DS_Store
 results/
-data/
+data/*
+!data/name/
+!data/name/*.csv
